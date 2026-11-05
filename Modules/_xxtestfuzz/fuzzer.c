@@ -595,6 +595,145 @@ static int _run_fuzz(const uint8_t *data, size_t size, int(*fuzzer)(const char* 
     return rv;
 }
 
+#define MAX_TEXTIO_TEST_SIZE 0x100000
+
+/* Fuzz io.TextIOWrapper over attacker-controlled bytes: the incremental
+   decoder, readahead buffer, newline normalisation, error handlers and
+   teardown paths are all C code in Modules/_io/*.c. Byte 0 selects the
+   encoding (C-implemented codecs incl. utf-16/32 with BOM detection),
+   byte 1 the error handler, byte 2 the newline mode, byte 3 the read
+   pattern and byte 4 the chunk size. */
+static PyObject* textio_bytesio_type = NULL;
+static PyObject* textio_wrapper_type = NULL;
+
+static const char* textio_encodings[] = {
+    "utf-8", "utf-16", "utf-16-le", "utf-16-be",
+    "utf-32", "utf-32-le", "utf-32-be", "latin-1",
+};
+static const char* textio_errors[] = {"strict", "replace", "ignore", "surrogateescape"};
+static const char* textio_newlines[] = {"", "\n", "\r", "\r\n"};
+
+/* Called by LLVMFuzzerTestOneInput for initialization */
+static int init_textio(void) {
+    PyObject* io_module = PyImport_ImportModule("io");
+    if (io_module == NULL) {
+        return 0;
+    }
+    textio_bytesio_type = PyObject_GetAttrString(io_module, "BytesIO");
+    textio_wrapper_type = PyObject_GetAttrString(io_module, "TextIOWrapper");
+    Py_DECREF(io_module);
+    return (textio_bytesio_type != NULL && textio_wrapper_type != NULL);
+}
+
+/* Clear the expected decode failure; leave anything else set so
+   _run_fuzz's last-ditch check can surface it. */
+static void textio_clear_decode_error(void) {
+    if (PyErr_ExceptionMatches(PyExc_UnicodeDecodeError)) {
+        PyErr_Clear();
+    }
+}
+
+/* Fuzz io.TextIOWrapper(io.BytesIO(data), encoding, errors, newline) */
+static int fuzz_textio(const char* data, size_t size) {
+    if (size < 5 || size > MAX_TEXTIO_TEST_SIZE) {
+        return 0;
+    }
+    unsigned char enc_idx = (unsigned char) data[0] % 8;
+    unsigned char err_idx = (unsigned char) data[1] % 4;
+    unsigned char nl_idx = (unsigned char) data[2] % 4;
+    unsigned char op = (unsigned char) data[3];
+    unsigned char chunk = (unsigned char) data[4];
+    data += 5;
+    size -= 5;
+
+    PyObject* input = PyObject_CallFunction(textio_bytesio_type, "y#",
+                                            data, (Py_ssize_t)size);
+    if (input == NULL) {
+        PyErr_Print();
+        abort();
+    }
+    PyObject* wrapper = PyObject_CallFunction(textio_wrapper_type, "Osss",
+                                              input,
+                                              textio_encodings[enc_idx],
+                                              textio_errors[err_idx],
+                                              textio_newlines[nl_idx]);
+    Py_DECREF(input);
+    if (wrapper == NULL) {
+        /* Only our own constants are passed: failure is a harness bug. */
+        PyErr_Print();
+        abort();
+    }
+
+    /* Drive reads in several patterns so the incremental decoder, the
+       readahead buffer and the newline machinery interact. Only
+       UnicodeDecodeError (strict handler on malformed bytes) is expected. */
+    switch (op % 4) {
+        case 0: {
+            /* one full read() */
+            PyObject* whole = PyObject_CallMethod(wrapper, "read", NULL);
+            if (whole == NULL) {
+                textio_clear_decode_error();
+            } else {
+                Py_DECREF(whole);
+            }
+            break;
+        }
+        case 1: {
+            /* readline() until EOF */
+            for (;;) {
+                PyObject* line = PyObject_CallMethod(wrapper, "readline", NULL);
+                if (line == NULL) {
+                    textio_clear_decode_error();
+                    break;
+                }
+                Py_ssize_t len = PyUnicode_GetLength(line);
+                Py_DECREF(line);
+                if (len == 0) {
+                    break;
+                }
+            }
+            break;
+        }
+        case 2: {
+            /* read(n) with varying chunk sizes */
+            Py_ssize_t n = 1 + (Py_ssize_t)(chunk % 64);
+            for (;;) {
+                PyObject* part = PyObject_CallMethod(wrapper, "read", "n", n);
+                if (part == NULL) {
+                    textio_clear_decode_error();
+                    break;
+                }
+                Py_ssize_t len = PyUnicode_GetLength(part);
+                Py_DECREF(part);
+                if (len == 0) {
+                    break;
+                }
+            }
+            break;
+        }
+        default: {
+            /* iterate lines through the wrapper's own iterator */
+            PyObject* iterator = PyObject_GetIter(wrapper);
+            if (iterator == NULL) {
+                textio_clear_decode_error();
+            } else {
+                PyObject* item;
+                while ((item = PyIter_Next(iterator)) != NULL) {
+                    Py_DECREF(item);
+                }
+                textio_clear_decode_error();
+                Py_DECREF(iterator);
+            }
+            break;
+        }
+    }
+
+    /* DECREF closes the wrapper, exercising flush/teardown. */
+    Py_DECREF(wrapper);
+    return 0;
+}
+
+
 /* CPython generates a lot of leak warnings for whatever reason. */
 int __lsan_is_turned_off(void) { return 1; }
 
@@ -726,6 +865,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_pycompile)
     rv |= _run_fuzz(data, size, fuzz_pycompile);
+#endif
+#if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_textio)
+    static int TEXTIO_INITIALIZED = 0;
+    if (!TEXTIO_INITIALIZED && !init_textio()) {
+        PyErr_Print();
+        abort();
+    } else {
+        TEXTIO_INITIALIZED = 1;
+    }
+
+    rv |= _run_fuzz(data, size, fuzz_textio);
 #endif
   return rv;
 }
